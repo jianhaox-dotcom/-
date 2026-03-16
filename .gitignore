@@ -1,0 +1,27 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 数据与输出（体积大，一般不传 GitHub）
+*.csv
+report/
+*.png
+!backtest_report.png
+
+# 系统与 IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# 环境与密钥
+.env
+.env.local
+*.pem
