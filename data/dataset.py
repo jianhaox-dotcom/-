@@ -31,6 +31,67 @@ def load_dataset(
     close_col = close_col or COL_CLOSE
     prediction_col = prediction_col or COL_PREDICTION
 
+    # ---------- 兼容「仅预测/回测特征」类 CSV ----------
+    # 这类文件通常只有：
+    #   #RET, VOL_CHANGE, BA_SPREAD, ILLIQUIDITY, sprtrn, TURNOVER, expected_RET, predicted_RET
+    # 没有 date/close/ret/ticker。我们用：
+    #   ticker = 文件名（去掉 _test_predictions 等后缀）
+    #   ret = #RET
+    #   close = (1+ret).cumprod()（合成价格，仅影响份额计算的标度，不影响回报）
+    #   date = 从固定基准日开始的合成日历（按行序递增）
+    if "#RET" in df.columns and "date" not in df.columns:
+        ticker = path.stem
+        for suffix in ["_test_predictions", "_predictions", "_test_prediction", "_prediction", "_test"]:
+            if ticker.endswith(suffix):
+                ticker = ticker[: -len(suffix)]
+        if not ticker:
+            ticker = "single"
+
+        df = df.copy()
+        df["ticker"] = ticker
+        df = df.rename(columns={"#RET": "ret"})
+        df["ret"] = pd.to_numeric(df["ret"], errors="coerce").fillna(0.0)
+
+        # 用附近的数字文件夹名当作 split 序号（例如 root/TICKER/0/TICKER_test_predictions.csv）
+        split_id = 0
+        try:
+            for parent in path.parents:
+                name = parent.name
+                if name.isdigit():
+                    split_id = int(name)
+                    break
+        except Exception:
+            split_id = 0
+
+        base_date = pd.Timestamp("2000-01-01")
+        n = len(df)
+        day_idx = split_id * n + pd.Series(range(n)).astype(int).values
+        df["date"] = base_date + pd.to_timedelta(day_idx, unit="D")
+        # 合成 close：从 1 开始累计回报
+        df["close"] = (1.0 + df["ret"]).cumprod()
+
+        # 可选列统一命名（和后续 pipeline 保持一致）
+        rename_map = {
+            "VOL_CHANGE": "vol_change",
+            "BA_SPREAD": "ba_spread",
+            "ILLIQUIDITY": "illiquidity",
+            "TURNOVER": "turnover",
+            "sprtrn": "sprtrn",
+        }
+        for old_name, new_name in rename_map.items():
+            if old_name in df.columns and new_name not in df.columns:
+                df = df.rename(columns={old_name: new_name})
+
+        keep = ["date", "ticker", "close", "ret"]
+        for c in ["vol_change", "ba_spread", "illiquidity", "turnover", "sprtrn"]:
+            if c in df.columns:
+                keep.append(c)
+        # 若存在真实标签/预测标签列，保留给 features 直接用作 target
+        for c in ["expected_RET", "predicted_RET"]:
+            if c in df.columns:
+                keep.append(c)
+        return df[keep].sort_values(["ticker", "date"]).reset_index(drop=True).dropna(subset=["close", "ret"])
+
     # 兼容常见列名
     def _pick(col: str, aliases: list[str]) -> str:
         if col in df.columns:

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 from config import INITIAL_CAPITAL, MAX_WEIGHT_PER_STOCK, REBALANCE_DAYS
 from models import train_predictor, predict, train_ensemble, predict_ensemble
@@ -31,6 +31,9 @@ def walk_forward_panel(
     top_n: int = 10,
     train_days: int = 252 * 3,
     test_days: int = 252 // 2,
+    market_exposure_series: Optional[pd.Series] = None,
+    rebalance_days: Optional[int] = None,
+    use_predicted_signal: bool = False,
 ) -> Dict[str, Any]:
     """
     对多股票面板数据进行 walk-forward：
@@ -44,7 +47,9 @@ def walk_forward_panel(
 
     global_eq: pd.Series | None = None
     benchmark_compound = 1.0  # (1+r1)*(1+r2)*...
+    all_test_dates = []  # 收集所有测试日，用于算同池等权基准
     for idx, (train_range, test_range) in enumerate(_segment_dates(all_dates, train_days, test_days)):
+        all_test_dates.extend(test_range.tolist())
         train_mask = df["date"].isin(train_range)
         test_mask = df["date"].isin(test_range)
         train_df = df.loc[train_mask].copy()
@@ -52,26 +57,59 @@ def walk_forward_panel(
         if train_df.empty or test_df.empty:
             continue
 
-        # 训练模型
-        X_train = train_df[FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0)
+        # 训练/预测分数：
+        # - 默认：用历史特征训练模型，预测 target（未来收益）
+        # - 开启 use_predicted_signal：用 predicted_RET 校准到 target，输出校准后的分数用于排序
         y_train = train_df["target"]
-        valid = y_train.notna()
-        X_train, y_train = X_train.loc[valid], y_train.loc[valid]
-        if len(X_train) == 0:
-            continue
-        X_test = (
-            test_df[FEATURE_NAMES]
-            .reindex(columns=FEATURE_NAMES)
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0)
-        )
-        test_df = test_df.copy()
-        if model_type == "ensemble":
-            fitted = train_ensemble(X_train, y_train, use_xgb=False)
-            test_df["prediction"] = predict_ensemble(fitted, X_test)
+        if use_predicted_signal:
+            if "predicted_RET" not in train_df.columns or "predicted_RET" not in test_df.columns:
+                raise ValueError("use_predicted_signal 但数据中缺少 predicted_RET 列")
+            _pred = pd.to_numeric(train_df["predicted_RET"], errors="coerce")
+            _y = pd.to_numeric(y_train, errors="coerce")
+            valid_dir = _pred.notna() & _y.notna() & np.isfinite(_pred.values) & np.isfinite(_y.values)
+            invert_dir = False
+            if valid_dir.sum() > 20:
+                corr_dir = float(np.corrcoef(_pred.loc[valid_dir].values, _y.loc[valid_dir].values)[0, 1])
+                invert_dir = corr_dir < 0
+            feature_col = "predicted_RET"
+            if invert_dir:
+                train_df = train_df.copy()
+                test_df = test_df.copy()
+                train_df["predicted_RET"] = -pd.to_numeric(train_df["predicted_RET"], errors="coerce")
+                test_df["predicted_RET"] = -pd.to_numeric(test_df["predicted_RET"], errors="coerce")
+
+            X_train = train_df[[feature_col]].replace([np.inf, -np.inf], np.nan).fillna(0)
+            valid = y_train.notna()
+            X_train, y_train = X_train.loc[valid], y_train.loc[valid]
+            if len(X_train) == 0:
+                continue
+            X_test = test_df[[feature_col]].replace([np.inf, -np.inf], np.nan).fillna(0)
+            test_df = test_df.copy()
+            if model_type == "ensemble":
+                fitted = train_ensemble(X_train, y_train, use_xgb=False)
+                test_df["prediction"] = predict_ensemble(fitted, X_test)
+            else:
+                fitted = train_predictor(X_train, y_train, model_type=model_type)
+                test_df["prediction"] = predict(fitted, X_test)
         else:
-            fitted = train_predictor(X_train, y_train, model_type=model_type)
-            test_df["prediction"] = predict(fitted, X_test)
+            X_train = train_df[FEATURE_NAMES].replace([np.inf, -np.inf], np.nan).fillna(0)
+            valid = y_train.notna()
+            X_train, y_train = X_train.loc[valid], y_train.loc[valid]
+            if len(X_train) == 0:
+                continue
+            X_test = (
+                test_df[FEATURE_NAMES]
+                .reindex(columns=FEATURE_NAMES)
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0)
+            )
+            test_df = test_df.copy()
+            if model_type == "ensemble":
+                fitted = train_ensemble(X_train, y_train, use_xgb=False)
+                test_df["prediction"] = predict_ensemble(fitted, X_test)
+            else:
+                fitted = train_predictor(X_train, y_train, model_type=model_type)
+                test_df["prediction"] = predict(fitted, X_test)
         # 综合打分：prediction*0.7 + 低波动*0.3
         if "volatility_20" in test_df.columns:
             vol_rank = test_df.groupby("date")["volatility_20"].rank(pct=True, ascending=True).fillna(0.5)
@@ -87,7 +125,8 @@ def walk_forward_panel(
             initial_cash=INITIAL_CAPITAL if global_eq is None else float(global_eq.iloc[-1]),
             rank_col=rank_col,
             max_weight_per_stock=MAX_WEIGHT_PER_STOCK,
-            rebalance_days=REBALANCE_DAYS,
+            rebalance_days=rebalance_days if rebalance_days is not None else REBALANCE_DAYS,
+            market_exposure=market_exposure_series,
         )
         eq_seg: pd.Series = panel_result["equity_curve"]
         if eq_seg is None or len(eq_seg) == 0:
@@ -118,7 +157,17 @@ def walk_forward_panel(
             "sharpe_ratio": 0.0,
             "max_drawdown": 0.0,
             "benchmark_return": None,
+            "benchmark_universe_return": None,
         }
+
+    # 同池等权基准：所有测试日上 496 只每日等权复利
+    benchmark_universe = None
+    if all_test_dates and "ret" in df.columns:
+        sub = df.loc[df["date"].isin(all_test_dates), ["date", "ret"]].copy()
+        sub["ret"] = pd.to_numeric(sub["ret"], errors="coerce").fillna(0)
+        daily = sub.groupby("date")["ret"].mean()
+        if len(daily) > 0:
+            benchmark_universe = float((1 + daily).prod() - 1)
 
     final_value = float(global_eq.iloc[-1])
     total_return = (final_value - INITIAL_CAPITAL) / INITIAL_CAPITAL
@@ -137,5 +186,6 @@ def walk_forward_panel(
         "sharpe_ratio": float(sharpe),
         "max_drawdown": float(max_dd),
         "benchmark_return": benchmark_return,
+        "benchmark_universe_return": benchmark_universe,
     }
 

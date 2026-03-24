@@ -81,13 +81,18 @@ def build_features(
         out["excess_ret_5"] = out["momentum_5"] - sprtrn
 
     # ---------- 目标：未来 N 日收益（减少噪音，仅用于训练） ----------
-    close = out["close"].astype(float)
-    if target_forward_days <= 1:
-        out["target"] = g["ret"].shift(-1).reset_index(drop=True)
+    # 如果文件提供 expected_RET 且我们要预测的是 1 日收益，则直接使用 expected_RET 作为目标；
+    # 否则按 close 计算未来 N 日收益（避免口径错位）。
+    if "expected_RET" in out.columns and target_forward_days <= 1:
+        out["target"] = pd.to_numeric(out["expected_RET"], errors="coerce")
     else:
-        # 未来 N 日累计收益 = (close_{t+N} / close_t) - 1，按 ticker 分组
-        fwd_close = g["close"].shift(-target_forward_days).reset_index(drop=True)
-        out["target"] = (fwd_close / close - 1.0).fillna(np.nan)
+        close = out["close"].astype(float)
+        if target_forward_days <= 1:
+            out["target"] = g["ret"].shift(-1).reset_index(drop=True)
+        else:
+            # 未来 N 日累计收益 = (close_{t+N} / close_t) - 1，按 ticker 分组
+            fwd_close = g["close"].shift(-target_forward_days).reset_index(drop=True)
+            out["target"] = (fwd_close / close - 1.0).fillna(np.nan)
 
     # 特征名：排除日期/价格/目标/原始成本列，保留数值型衍生特征
     exclude = {
@@ -96,6 +101,8 @@ def build_features(
         "close",
         "ret",
         "target",
+        "expected_RET",
+        "predicted_RET",
         "tran_cost",
         "ask",
         "bid",
