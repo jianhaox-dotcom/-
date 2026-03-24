@@ -24,6 +24,7 @@ def run_portfolio_backtest(
     market_exposure: Optional[pd.Series] = None,
     short_notional_ratio: float = 0.0,
     short_when_no_long_ratio: float = 0.0,
+    equal_weight_long_if_no_positive: bool = False,
 ) -> dict:
     """
     df 需含: date, id_col, close, 以及 rank_col（用于排序选股，如 prediction 或 score）。
@@ -33,6 +34,8 @@ def run_portfolio_backtest(
     short_notional_ratio: 做空名义（以多头名义的比例计）。例如 0.25 表示做空名义=多头名义*0.25（不会做完全对冲）。
     short_when_no_long_ratio: 当 short_notional_ratio==0 且本日没有任何正分可做多时，对预测最差且分数<0 的股票做空，
         空头名义 = 当日权益目标 equity_target × 该比例（与「无多时补空」配合）。
+    equal_weight_long_if_no_positive: 为 True 时，若按「正分」筛完后没有多头权重，则改按 rank_col 排序取 head(top_n) 等权做多
+        （用于短样本内预测全为负时仍持仓，避免空仓跑输大盘）。
     """
     if id_col not in df.columns or rank_col not in df.columns:
         return {"error": f"缺少列 {id_col} 或 {rank_col}", "total_return": 0.0, "final_value": initial_cash}
@@ -106,6 +109,19 @@ def run_portfolio_backtest(
                     if float(score_long.sum()) > 0:
                         w_raw = score_long / float(score_long.sum())
                         w_capped = w_raw.clip(upper=max_w)
+                        if float(w_capped.sum()) > 0:
+                            w_capped = w_capped / float(w_capped.sum())
+                            weights_long = w_capped.to_dict()
+
+                if equal_weight_long_if_no_positive and n_long and not weights_long:
+                    long_tickers = rank.head(n_long)[id_col].tolist()
+                    weights_long = {}
+                    if long_tickers:
+                        k = len(long_tickers)
+                        base = 1.0 / float(k)
+                        weights_long = {t: base for t in long_tickers}
+                        w_ser = pd.Series(weights_long, dtype=float)
+                        w_capped = w_ser.clip(upper=max_w)
                         if float(w_capped.sum()) > 0:
                             w_capped = w_capped / float(w_capped.sum())
                             weights_long = w_capped.to_dict()

@@ -133,6 +133,12 @@ def main():
         help="数据路径：单个 CSV 或包含多只股票 CSV 的目录",
     )
     parser.add_argument("--test-ratio", type=float, default=TEST_RATIO, help="简单切分测试集比例（非 walk-forward 时使用）")
+    parser.add_argument(
+        "--test-last-trading-days",
+        type=int,
+        default=None,
+        help="在按 test-ratio 划出的测试段内，只保留最后 N 个交易日再回测与算基准（约三个月用 63）",
+    )
     parser.add_argument("--model", default="rf", choices=["ridge", "rf", "xgb", "ensemble"], help="预测模型（ensemble=Ridge+RF+可选XGB 取平均）")
     parser.add_argument("--walk-forward", action="store_true", help="使用 walk-forward 回测")
     parser.add_argument("--top-n", type=int, default=20, help="组合做多股票数量（单票最大权重 5% 时建议≥20）")
@@ -162,6 +168,11 @@ def main():
         "--use-predicted-as-feature",
         action="store_true",
         help="把 predicted_RET 当作额外输入特征（仍使用真实 target 训练评估）",
+    )
+    parser.add_argument(
+        "--rank-long-always",
+        action="store_true",
+        help="与 --predicted-direct-score 联用：按预测排序选股；若当日无正分，则对 top_n 等权做多，避免空仓在上涨市大幅跑输 sprtrn",
     )
     args = parser.parse_args()
 
@@ -258,9 +269,21 @@ def main():
     cut_idx = int(len(dates) * (1 - args.test_ratio))
     train_dates = dates[:cut_idx]
     test_dates = dates[cut_idx:]
-    train_df = df[df["date"].isin(train_dates)].copy()
-    test_df = df[df["date"].isin(test_dates)].copy()
-    print(f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)}")
+    if args.test_last_trading_days is not None and int(args.test_last_trading_days) > 0:
+        n_keep = int(args.test_last_trading_days)
+        td_sorted = np.sort(pd.to_datetime(test_dates))
+        if len(td_sorted) > n_keep:
+            test_dates = td_sorted[-n_keep:]
+        train_df = df[df["date"].isin(train_dates)].copy()
+        test_df = df[df["date"].isin(test_dates)].copy()
+        print(
+            f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)} "
+            f"（测试段已截断为最后 {len(np.unique(test_dates))} 个交易日）"
+        )
+    else:
+        train_df = df[df["date"].isin(train_dates)].copy()
+        test_df = df[df["date"].isin(test_dates)].copy()
+        print(f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)}")
 
     # ---------- 4. 用于选股排序的“预测分数” ----------
     # - 默认：用历史特征训练模型，预测 target（未来收益）
@@ -341,11 +364,11 @@ def main():
     # ---------- 5. 综合打分选股：prediction*0.7 + 低波动*0.3，单票最大 5%，20 日再平衡 ----------
     if args.predicted_direct_score:
         pred_score = pd.to_numeric(test_df["prediction"], errors="coerce")
-        if float(args.short_ratio) > 0:
-            # 启用做空：score<0 的股票参与做空
+        if float(args.short_ratio) > 0 or args.rank_long_always:
+            # 做空或「无正分仍按排名做多」需要保留分数符号用于排序/选空
             test_df["score"] = pred_score
         else:
-            # 不启用做空：只做多（负分不建仓）
+            # 纯多头：负分不建仓
             test_df["score"] = pred_score.clip(lower=0.0)
     elif "volatility_20" in test_df.columns:
         # 日内波动率升序排名：低波动 rank 小，low_vol_score=1-rank 则低波动得高分
@@ -355,6 +378,11 @@ def main():
     else:
         test_df["score"] = test_df["prediction"]
     rank_col = "score"
+
+    if args.rank_long_always and not args.predicted_direct_score:
+        print("  警告: --rank-long-always 仅在与 --predicted-direct-score 联用时生效，已忽略。")
+    if args.rank_long_always and args.predicted_direct_score:
+        print("  已开启 rank-long-always：无正分时对预测排序 top_n 等权做多")
 
     panel_result = run_portfolio_backtest(
         test_df,
@@ -367,6 +395,7 @@ def main():
         rebalance_days=rebal_days,
         market_exposure=market_exposure,
         short_notional_ratio=float(args.short_ratio),
+        equal_weight_long_if_no_positive=bool(args.rank_long_always and args.predicted_direct_score),
     )
     eq = panel_result["equity_curve"]
     test_dates_sorted = np.sort(test_df["date"].unique())
