@@ -56,6 +56,75 @@ def market_exposure_series(df: pd.DataFrame, ma_days: int = 20) -> pd.Series | N
     return pd.Series(exposure, index=sub.index)
 
 
+def sprtrn_daily_return_series(df: pd.DataFrame) -> pd.Series | None:
+    """按交易日去重后的 sprtrn 日收益序列，index 为 date。"""
+    if "sprtrn" not in df.columns:
+        return None
+    sub = df[["date", "sprtrn"]].drop_duplicates("date", keep="first").sort_values("date")
+    r = pd.to_numeric(sub["sprtrn"], errors="coerce").fillna(0.0)
+    idx = pd.DatetimeIndex(pd.to_datetime(sub["date"].values))
+    return pd.Series(r.values, index=idx)
+
+
+def merged_market_exposure(
+    df: pd.DataFrame,
+    *,
+    timing: bool,
+    vol_target_ann: float | None,
+    vol_lookback: int = 21,
+    vol_floor: float = 0.45,
+    vol_cap: float = 1.0,
+) -> tuple[pd.Series | None, list[str]]:
+    """择时与「大盘波动率目标」乘在一条暴露序列上；无任一功能时返回 (None, [])。"""
+    msgs: list[str] = []
+    if not timing and (vol_target_ann is None or float(vol_target_ann) <= 0):
+        return None, msgs
+
+    dates = pd.DatetimeIndex(pd.to_datetime(df["date"].drop_duplicates().sort_values().unique()))
+    tser = market_exposure_series(df) if timing else None
+    if timing:
+        if tser is not None:
+            msgs.append("  已开启大盘择时（20 日均线下方半仓、上方满仓）")
+        else:
+            msgs.append("  警告: --timing 已开启但数据无 sprtrn，择时未生效")
+
+    vser = None
+    if vol_target_ann is not None and float(vol_target_ann) > 0:
+        if "sprtrn" not in df.columns:
+            msgs.append("  警告: --vol-target-ann 需要 sprtrn 列，未启用波动缩放")
+        else:
+            sub = df[["date", "sprtrn"]].drop_duplicates("date", keep="first").sort_values("date")
+            r = pd.to_numeric(sub["sprtrn"], errors="coerce").fillna(0.0)
+            lb = max(5, int(vol_lookback))
+            minp = max(3, lb // 3)
+            rv = r.rolling(lb, min_periods=minp).std(ddof=0) * np.sqrt(252.0)
+            tgt = float(vol_target_ann)
+            mult = tgt / rv.replace(0.0, np.nan)
+            mult = mult.clip(lower=float(vol_floor), upper=float(vol_cap)).fillna(1.0)
+            vser = pd.Series(mult.values, index=pd.DatetimeIndex(pd.to_datetime(sub["date"].values)))
+            msgs.append(
+                f"  已按 sprtrn 滚动波动做暴露缩放：目标年化≈{tgt:.0%}，窗口 {lb} 日，乘子∈[{vol_floor},{vol_cap}]（可与择时叠乘）"
+            )
+
+    if tser is None and vser is None:
+        return None, msgs
+
+    if tser is not None:
+        t_part = tser.reindex(dates).ffill().bfill()
+        if bool(t_part.isna().all()):
+            t_part = pd.Series(1.0, index=dates)
+    else:
+        t_part = pd.Series(1.0, index=dates)
+    if vser is not None:
+        v_part = vser.reindex(dates).ffill().bfill()
+        if bool(v_part.isna().all()):
+            v_part = pd.Series(1.0, index=dates)
+    else:
+        v_part = pd.Series(1.0, index=dates)
+    merged = (t_part.astype(float) * v_part.astype(float)).clip(0.0, 1.0)
+    return merged, msgs
+
+
 def apply_conditional_index_short(
     long_equity: pd.Series,
     test_dates: np.ndarray | list,
@@ -124,6 +193,194 @@ def universe_equal_weight_return(df: pd.DataFrame, dates) -> float | None:
     return float((1 + daily).prod() - 1)
 
 
+def run_rolling_test_windows(
+    test_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    *,
+    window: int,
+    step: int,
+    top_n: int,
+    bottom_n: int,
+    rebalance_days: int,
+    market_exposure,
+    short_notional_ratio: float,
+    rank_col: str,
+    equal_weight_long_if_no_positive: bool,
+    max_weight_per_stock: float,
+    benchmark_daily_ret: pd.Series | None = None,
+    benchmark_leg_fraction: float = 0.0,
+) -> list[dict]:
+    """在完整测试段上按交易日滑动 window 日，每窗跑一次组合回测并算 sprtrn/等权。"""
+    dates_u = np.sort(test_df["date"].unique())
+    n = len(dates_u)
+    if n < window:
+        return []
+    rows: list[dict] = []
+    for start in range(0, n - window + 1, step):
+        wdates = dates_u[start : start + window]
+        sub = test_df[test_df["date"].isin(wdates)]
+        if sub.empty:
+            continue
+        pr = run_portfolio_backtest(
+            sub,
+            id_col="ticker",
+            top_n=top_n,
+            bottom_n=bottom_n,
+            initial_cash=INITIAL_CAPITAL,
+            rank_col=rank_col,
+            max_weight_per_stock=max_weight_per_stock,
+            rebalance_days=rebalance_days,
+            market_exposure=market_exposure,
+            short_notional_ratio=short_notional_ratio,
+            equal_weight_long_if_no_positive=equal_weight_long_if_no_positive,
+            benchmark_daily_ret=benchmark_daily_ret,
+            benchmark_leg_fraction=benchmark_leg_fraction,
+        )
+        st = float(pr["total_return"])
+        bench = benchmark_return_over_dates(full_df, wdates)
+        univ = universe_equal_weight_return(full_df, wdates)
+        rows.append(
+            {
+                "start_date": wdates[0],
+                "end_date": wdates[-1],
+                "strat": st,
+                "bench": bench,
+                "univ": univ,
+                "ex_bench": (st - bench) if bench is not None else None,
+                "ex_univ": (st - univ) if univ is not None else None,
+            }
+        )
+    return rows
+
+
+def _summarize_rolling_excess(name: str, excesses: list[float]) -> None:
+    if not excesses:
+        return
+    xs = np.asarray(excesses, dtype=float)
+    win = float(np.mean(xs > 0))
+    print(f"  [{name}] 窗口数 {len(xs)} | 跑赢比例 {win:.2%}")
+    print(f"    超额均值 {float(np.mean(xs)):.2%} | 中位数 {float(np.median(xs)):.2%}")
+    print(f"    分位 p25/p75 {float(np.percentile(xs, 25)):.2%} / {float(np.percentile(xs, 75)):.2%}")
+    print(f"    最小/最大超额 {float(np.min(xs)):.2%} / {float(np.max(xs)):.2%}")
+
+
+def run_nonoverlapping_bucket_backtests(
+    test_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    *,
+    bucket_trading_days: int,
+    top_n: int,
+    bottom_n: int,
+    rebalance_days: int,
+    market_exposure,
+    short_notional_ratio: float,
+    rank_col: str,
+    equal_weight_long_if_no_positive: bool,
+    max_weight_per_stock: float,
+    benchmark_daily_ret: pd.Series | None,
+    benchmark_leg_fraction: float,
+) -> list[dict]:
+    """按连续 N 个交易日无重叠切块，每段独立初始资金回测，并算同期 sprtrn / 等权。"""
+    dates_u = np.sort(test_df["date"].unique())
+    n = len(dates_u)
+    bd = max(1, int(bucket_trading_days))
+    min_days = 5
+    rows: list[dict] = []
+    i = 0
+    seg = 0
+    while i < n:
+        j = min(i + bd, n)
+        chunk_dates = dates_u[i:j]
+        if len(chunk_dates) < min_days:
+            break
+        sub = test_df[test_df["date"].isin(chunk_dates)]
+        if sub.empty:
+            i = j
+            continue
+        pr = run_portfolio_backtest(
+            sub,
+            id_col="ticker",
+            top_n=top_n,
+            bottom_n=bottom_n,
+            initial_cash=INITIAL_CAPITAL,
+            rank_col=rank_col,
+            max_weight_per_stock=max_weight_per_stock,
+            rebalance_days=rebalance_days,
+            market_exposure=market_exposure,
+            short_notional_ratio=short_notional_ratio,
+            equal_weight_long_if_no_positive=equal_weight_long_if_no_positive,
+            benchmark_daily_ret=benchmark_daily_ret,
+            benchmark_leg_fraction=benchmark_leg_fraction,
+        )
+        st = float(pr["total_return"])
+        bench = benchmark_return_over_dates(full_df, chunk_dates)
+        univ = universe_equal_weight_return(full_df, chunk_dates)
+        ex_b = (st - bench) if bench is not None else None
+        ex_u = (st - univ) if univ is not None else None
+        seg += 1
+        rows.append(
+            {
+                "segment": seg,
+                "n_days": len(chunk_dates),
+                "start_date": chunk_dates[0],
+                "end_date": chunk_dates[-1],
+                "strat": st,
+                "bench": bench,
+                "univ": univ,
+                "ex_bench": ex_b,
+                "ex_univ": ex_u,
+                "beat_bench": (ex_b > 0) if ex_b is not None else None,
+                "beat_univ": (ex_u > 0) if ex_u is not None else None,
+            }
+        )
+        i = j
+    return rows
+
+
+def print_bucket_feedback_report(rows: list[dict]) -> None:
+    if not rows:
+        print("  无有效分段（数据过短或 bucket 过大）。")
+        return
+    print(f"  {'段':>4} {'交易日':>6} {'起止日期':^24} {'策略':>10} {'sprtrn':>10} {'超额':>8} {'跑赢大盘':>8} | {'等权':>8} {'超额':>8} {'跑赢等权':>8}")
+    for r in rows:
+        d0 = pd.Timestamp(r["start_date"]).strftime("%Y-%m-%d")
+        d1 = pd.Timestamp(r["end_date"]).strftime("%Y-%m-%d")
+        sb = f"{r['strat']:.2%}"
+        bb = f"{r['bench']:.2%}" if r["bench"] is not None else "  —"
+        eb = f"{r['ex_bench']:.2%}" if r["ex_bench"] is not None else "   —"
+        yb = "是" if r["beat_bench"] is True else ("否" if r["beat_bench"] is False else "—")
+        ub = f"{r['univ']:.2%}" if r["univ"] is not None else "    —"
+        eu = f"{r['ex_univ']:.2%}" if r["ex_univ"] is not None else "   —"
+        yu = "是" if r["beat_univ"] is True else ("否" if r["beat_univ"] is False else "—")
+        print(
+            f"  {r['segment']:4d} {r['n_days']:6d} {d0}~{d1} {sb:>10} {bb:>10} {eb:>8} {yb:>8} | {ub:>8} {eu:>8} {yu:>8}"
+        )
+    beats_b = [r for r in rows if r["beat_bench"] is True]
+    misses_b = [r for r in rows if r["beat_bench"] is False]
+    nb = len(beats_b)
+    mb = len(misses_b)
+    tot_b = nb + mb
+    if tot_b > 0:
+        print(
+            f"\n  跑赢大盘(sprtrn)段数: {nb} / {tot_b} = {nb / tot_b:.2%}（未跑赢 {mb} 段）"
+        )
+    beats_u = [r for r in rows if r["beat_univ"] is True]
+    misses_u = [r for r in rows if r["beat_univ"] is False]
+    nu = len(beats_u)
+    mu = len(misses_u)
+    tot_u = nu + mu
+    if tot_u > 0:
+        print(
+            f"  跑赢股票池等权段数: {nu} / {tot_u} = {nu / tot_u:.2%}（未跑赢 {mu} 段）"
+        )
+    ex_bs = [float(r["ex_bench"]) for r in rows if r["ex_bench"] is not None]
+    if ex_bs:
+        xb = np.asarray(ex_bs, dtype=float)
+        print(
+            f"  各段相对大盘超额: 均值 {float(np.mean(xb)):.2%} | 中位数 {float(np.median(xb)):.2%}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="量化回测流程：多股票特征→模型→组合→回测→风险→图表")
     parser.add_argument(
@@ -134,14 +391,20 @@ def main():
     )
     parser.add_argument("--test-ratio", type=float, default=TEST_RATIO, help="简单切分测试集比例（非 walk-forward 时使用）")
     parser.add_argument(
+        "--test-first-trading-days",
+        type=int,
+        default=None,
+        help="在 test-ratio 测试段内只保留最初 N 个交易日（与 --test-last-trading-days 二选一，约三个月用 63）",
+    )
+    parser.add_argument(
         "--test-last-trading-days",
         type=int,
         default=None,
-        help="在按 test-ratio 划出的测试段内，只保留最后 N 个交易日再回测与算基准（约三个月用 63）",
+        help="在 test-ratio 测试段内只保留最后 N 个交易日（与 --test-first-trading-days 二选一，约三个月用 63）",
     )
     parser.add_argument("--model", default="rf", choices=["ridge", "rf", "xgb", "ensemble"], help="预测模型（ensemble=Ridge+RF+可选XGB 取平均）")
     parser.add_argument("--walk-forward", action="store_true", help="使用 walk-forward 回测")
-    parser.add_argument("--top-n", type=int, default=20, help="组合做多股票数量（单票最大权重 5% 时建议≥20）")
+    parser.add_argument("--top-n", type=int, default=20, help="组合做多股票数量（单票最大权重 5%% 时建议≥20）")
     parser.add_argument("--no-plot", action="store_true", help="不生成图表")
     parser.add_argument("--out-dir", default=".", help="图表与报告输出目录")
     parser.add_argument("--timing", action="store_true", help="大盘择时：20日均线下方半仓、上方满仓")
@@ -173,6 +436,49 @@ def main():
         "--rank-long-always",
         action="store_true",
         help="与 --predicted-direct-score 联用：按预测排序选股；若当日无正分，则对 top_n 等权做多，避免空仓在上涨市大幅跑输 sprtrn",
+    )
+    parser.add_argument(
+        "--rolling-test-days",
+        type=int,
+        default=None,
+        help="在完整测试段上滑动 N 个交易日，逐窗回测并与 sprtrn/等权对比（如 63）；与「最后 N 天单次回测」不同，用于检验策略是否只在特定区间有效",
+    )
+    parser.add_argument(
+        "--rolling-step",
+        type=int,
+        default=1,
+        help="滑动步长（默认 1=每个可能起点一个窗口；可改为 5/21/63 加快速度）",
+    )
+    parser.add_argument(
+        "--bucket-feedback-days",
+        type=int,
+        default=None,
+        help="将当前分析用测试面板按每段连续 N 个交易日无重叠切块（如 63≈季），每段独立回测并对比 sprtrn/等权，打印各段是否跑赢及总体占比",
+    )
+    parser.add_argument(
+        "--blend-sprtrn",
+        type=float,
+        default=0.0,
+        help="0~1：目标多头名义中该比例按 sprtrn 日复利复制大盘，其余做选股多头，降低相对大盘的跟踪误差、超额更稳（需 sprtrn；勿与 --short-ratio>0 同用）",
+    )
+    parser.add_argument(
+        "--vol-target-ann",
+        type=float,
+        default=None,
+        help="若设置（如 0.12）：用 sprtrn 滚动日波动估计年化波动，将总暴露乘子夹在 [floor,cap]，高波动日自动减仓（可与 --timing 叠乘，需 sprtrn）",
+    )
+    parser.add_argument("--vol-target-lookback", type=int, default=21, help="--vol-target-ann 的滚动天数")
+    parser.add_argument(
+        "--vol-target-floor",
+        type=float,
+        default=0.45,
+        help="波动缩放乘子下限（避免满仓过狠）",
+    )
+    parser.add_argument(
+        "--vol-target-cap",
+        type=float,
+        default=1.0,
+        help="波动缩放乘子上限",
     )
     args = parser.parse_args()
 
@@ -213,10 +519,29 @@ def main():
     df = build_features(df, target_forward_days=args.target_forward_days)
     print(f"2. 特征工程完成 | 总样本 {len(df)} | 特征数: {len(FEATURE_NAMES)} | target_forward_days={args.target_forward_days}")
 
-    # 择时：大盘 20 日均线向上满仓、向下半仓（仅当 --timing 且存在 sprtrn）
-    market_exposure = market_exposure_series(df) if args.timing else None
-    if args.timing and market_exposure is not None:
-        print("  已开启大盘择时（20 日均线下方半仓、上方满仓）")
+    market_exposure, _exp_msgs = merged_market_exposure(
+        df,
+        timing=args.timing,
+        vol_target_ann=args.vol_target_ann,
+        vol_lookback=args.vol_target_lookback,
+        vol_floor=args.vol_target_floor,
+        vol_cap=args.vol_target_cap,
+    )
+    for _m in _exp_msgs:
+        print(_m)
+
+    bench_daily = sprtrn_daily_return_series(df)
+    blend_f = 0.0
+    if float(args.blend_sprtrn) > 0 and float(args.short_ratio) <= 0:
+        if bench_daily is None:
+            print("  警告: --blend-sprtrn 需要 sprtrn 列，已忽略")
+        else:
+            blend_f = min(1.0, max(0.0, float(args.blend_sprtrn)))
+            print(
+                f"  已开启 sprtrn 复制腿：目标多头名义的 {blend_f:.1%} 按大盘日收益复利，{1.0 - blend_f:.1%} 为选股多头"
+            )
+    elif float(args.blend_sprtrn) > 0:
+        print("  警告: --blend-sprtrn 与 --short-ratio>0 不并用，已忽略")
 
     rebal_days = args.rebalance_days if args.rebalance_days is not None else REBALANCE_DAYS
 
@@ -230,6 +555,8 @@ def main():
             market_exposure_series=market_exposure,
             rebalance_days=rebal_days,
             use_predicted_signal=args.use_predicted_signal,
+            benchmark_daily_ret=bench_daily if blend_f > 0 else None,
+            benchmark_leg_fraction=blend_f,
         )
         eq = wf_result["equity_curve"]
         print("\n" + "=" * 72)
@@ -269,21 +596,11 @@ def main():
     cut_idx = int(len(dates) * (1 - args.test_ratio))
     train_dates = dates[:cut_idx]
     test_dates = dates[cut_idx:]
-    if args.test_last_trading_days is not None and int(args.test_last_trading_days) > 0:
-        n_keep = int(args.test_last_trading_days)
-        td_sorted = np.sort(pd.to_datetime(test_dates))
-        if len(td_sorted) > n_keep:
-            test_dates = td_sorted[-n_keep:]
-        train_df = df[df["date"].isin(train_dates)].copy()
-        test_df = df[df["date"].isin(test_dates)].copy()
-        print(
-            f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)} "
-            f"（测试段已截断为最后 {len(np.unique(test_dates))} 个交易日）"
-        )
-    else:
-        train_df = df[df["date"].isin(train_dates)].copy()
-        test_df = df[df["date"].isin(test_dates)].copy()
-        print(f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)}")
+    # 先保留完整测试段；打分后再截断做「单次回测」；滑动窗口在完整测试段上跑
+    train_df = df[df["date"].isin(train_dates)].copy()
+    test_df = df[df["date"].isin(test_dates)].copy()
+    n_test_days = len(np.unique(test_df["date"].values))
+    print(f"3. 划分训练/测试 | 训练 {len(train_df)} | 测试 {len(test_df)}（完整测试段 {n_test_days} 个交易日）")
 
     # ---------- 4. 用于选股排序的“预测分数” ----------
     # - 默认：用历史特征训练模型，预测 target（未来收益）
@@ -384,21 +701,128 @@ def main():
     if args.rank_long_always and args.predicted_direct_score:
         print("  已开启 rank-long-always：无正分时对预测排序 top_n 等权做多")
 
+    eq_long = bool(args.rank_long_always and args.predicted_direct_score)
+    bottom_n_bt = args.top_n if float(args.short_ratio) > 0 else 0
+
+    _tf = args.test_first_trading_days
+    _tl = args.test_last_trading_days
+    if _tf is not None and int(_tf) > 0 and _tl is not None and int(_tl) > 0:
+        print("错误: 请勿同时指定 --test-first-trading-days 与 --test-last-trading-days")
+        return
+
+    # 可选：全流程仅用测试段最初或最后 N 日（含 rolling / 单次回测 / IC / 基准）
+    if _tf is not None and int(_tf) > 0:
+        n_keep = int(_tf)
+        td_sorted = np.sort(test_df["date"].unique())
+        if len(td_sorted) > n_keep:
+            first_n = td_sorted[:n_keep]
+            test_df = test_df[test_df["date"].isin(first_n)].copy()
+            n_days = len(np.unique(test_df["date"].values))
+            print(
+                f"\n  已限定分析区间：测试段最初 {n_days} 个交易日（滑动回测、净值、IC、基准均只在此区间）"
+            )
+        else:
+            print(
+                f"\n  提示: --test-first-trading-days={n_keep} ≥ 当前测试段交易日数，仍使用全部测试日。"
+            )
+    elif _tl is not None and int(_tl) > 0:
+        n_keep = int(_tl)
+        td_sorted = np.sort(test_df["date"].unique())
+        if len(td_sorted) > n_keep:
+            last_n = td_sorted[-n_keep:]
+            test_df = test_df[test_df["date"].isin(last_n)].copy()
+            n_days = len(np.unique(test_df["date"].values))
+            print(
+                f"\n  已限定分析区间：测试段最后 {n_days} 个交易日（滑动回测、净值、IC、基准均只在此区间）"
+            )
+        else:
+            print(
+                f"\n  提示: --test-last-trading-days={n_keep} ≥ 当前测试段交易日数，仍使用全部测试日。"
+            )
+
+    if args.bucket_feedback_days is not None and int(args.bucket_feedback_days) > 0:
+        bfd = max(1, int(args.bucket_feedback_days))
+        bucket_rows = run_nonoverlapping_bucket_backtests(
+            test_df,
+            df,
+            bucket_trading_days=bfd,
+            top_n=args.top_n,
+            bottom_n=bottom_n_bt,
+            rebalance_days=rebal_days,
+            market_exposure=market_exposure,
+            short_notional_ratio=float(args.short_ratio),
+            rank_col=rank_col,
+            equal_weight_long_if_no_positive=eq_long,
+            max_weight_per_stock=MAX_WEIGHT_PER_STOCK,
+            benchmark_daily_ret=bench_daily if blend_f > 0 else None,
+            benchmark_leg_fraction=blend_f,
+        )
+        _bd_n = len(np.sort(test_df["date"].unique()))
+        print("\n" + "=" * 72)
+        print(f"按段反馈（无重叠；每段 {bfd} 个交易日，末段可不足；当前区间共 {_bd_n} 个交易日）")
+        print("=" * 72)
+        print_bucket_feedback_report(bucket_rows)
+        print("  （每段从 INITIAL_CAPITAL 独立回测，段与段不复利衔接；跑赢=该段策略累计收益高于同期基准）")
+
+    if args.rolling_test_days is not None and int(args.rolling_test_days) > 0:
+        rw = int(args.rolling_test_days)
+        rs = max(1, int(args.rolling_step))
+        _du = len(np.sort(test_df["date"].unique()))
+        if _du >= rw:
+            _nw = (_du - rw) // rs + 1
+            if _nw > 400:
+                print(
+                    f"  提示: 当前约 {_nw} 个滑动窗口，计算较久；可加 --rolling-step 21 或 63 加快速度"
+                )
+        roll_rows = run_rolling_test_windows(
+            test_df,
+            df,
+            window=rw,
+            step=rs,
+            top_n=args.top_n,
+            bottom_n=bottom_n_bt,
+            rebalance_days=rebal_days,
+            market_exposure=market_exposure,
+            short_notional_ratio=float(args.short_ratio),
+            rank_col=rank_col,
+            equal_weight_long_if_no_positive=eq_long,
+            max_weight_per_stock=MAX_WEIGHT_PER_STOCK,
+            benchmark_daily_ret=bench_daily if blend_f > 0 else None,
+            benchmark_leg_fraction=blend_f,
+        )
+        _an_days = len(np.sort(test_df["date"].unique()))
+        print("\n" + "=" * 72)
+        print(f"滑动窗口回测（当前分析区间共 {_an_days} 个交易日；每窗 {rw} 日，步长 {rs}）")
+        print("=" * 72)
+        if not roll_rows:
+            print("  测试段过短，无法形成窗口。")
+        else:
+            ex_b = [r["ex_bench"] for r in roll_rows if r["ex_bench"] is not None]
+            ex_u = [r["ex_univ"] for r in roll_rows if r["ex_univ"] is not None]
+            _summarize_rolling_excess("vs 大盘(sprtrn)", ex_b)
+            _summarize_rolling_excess("vs 股票池等权", ex_u)
+            print("  （每个窗口为当前分析区间内连续交易日，起点按步长滑动，非随机抽取）")
+
+    test_df_single = test_df
+    test_dates_for_bench = np.sort(test_df["date"].unique())
+
     panel_result = run_portfolio_backtest(
-        test_df,
+        test_df_single,
         id_col="ticker",
         top_n=args.top_n,
-        bottom_n=args.top_n if float(args.short_ratio) > 0 else 0,
+        bottom_n=bottom_n_bt,
         initial_cash=INITIAL_CAPITAL,
         rank_col=rank_col,
         max_weight_per_stock=MAX_WEIGHT_PER_STOCK,
         rebalance_days=rebal_days,
         market_exposure=market_exposure,
         short_notional_ratio=float(args.short_ratio),
-        equal_weight_long_if_no_positive=bool(args.rank_long_always and args.predicted_direct_score),
+        equal_weight_long_if_no_positive=eq_long,
+        benchmark_daily_ret=bench_daily if blend_f > 0 else None,
+        benchmark_leg_fraction=blend_f,
     )
     eq = panel_result["equity_curve"]
-    test_dates_sorted = np.sort(test_df["date"].unique())
+    test_dates_sorted = np.sort(test_df_single["date"].unique())
     eq_for_plot = eq
     is_long_short = float(args.short_ratio) > 0
     print("\n" + "=" * 72)
@@ -433,14 +857,14 @@ def main():
             print("  → 相对纯多头，叠加空头后总收益更高")
         else:
             print("  → 本段样本下叠加空头未提升总收益（属正常，空头只在部分下跌日盈利）")
-    bench = benchmark_return_over_dates(df, test_dates)
+    bench = benchmark_return_over_dates(df, test_dates_for_bench)
     if bench is not None:
         excess = panel_result["total_return"] - bench
         print(f"  同期大盘(sprtrn)收益: {bench:.2%}")
         print(f"  超额收益(vs大盘): {excess:.2%}")
         print("  结论: 跑赢大盘" if excess > 0 else "  结论: 未跑赢大盘")
     # 同池等权：496 只每日等权的收益，比「满仓指数」更公平
-    univ_ret = universe_equal_weight_return(df, test_dates)
+    univ_ret = universe_equal_weight_return(df, test_dates_for_bench)
     if univ_ret is not None:
         ex_univ = panel_result["total_return"] - univ_ret
         print(f"  同期股票池等权收益: {univ_ret:.2%}")
@@ -449,7 +873,7 @@ def main():
 
     # ---------- 5.1 回测分析：IC、分组收益 ----------
     print("\n预测与未来收益分析（IC / 分组）:")
-    report_ic_and_groups(test_df, pred_col="prediction", target_col="target", n_groups=5)
+    report_ic_and_groups(test_df_single, pred_col="prediction", target_col="target", n_groups=5)
 
     # ---------- 6. 可视化 ----------
     if not args.no_plot and eq is not None and len(eq) > 0:

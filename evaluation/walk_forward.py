@@ -34,6 +34,8 @@ def walk_forward_panel(
     market_exposure_series: Optional[pd.Series] = None,
     rebalance_days: Optional[int] = None,
     use_predicted_signal: bool = False,
+    benchmark_daily_ret: Optional[pd.Series] = None,
+    benchmark_leg_fraction: float = 0.0,
 ) -> Dict[str, Any]:
     """
     对多股票面板数据进行 walk-forward：
@@ -127,6 +129,8 @@ def walk_forward_panel(
             max_weight_per_stock=MAX_WEIGHT_PER_STOCK,
             rebalance_days=rebalance_days if rebalance_days is not None else REBALANCE_DAYS,
             market_exposure=market_exposure_series,
+            benchmark_daily_ret=benchmark_daily_ret,
+            benchmark_leg_fraction=benchmark_leg_fraction,
         )
         eq_seg: pd.Series = panel_result["equity_curve"]
         if eq_seg is None or len(eq_seg) == 0:

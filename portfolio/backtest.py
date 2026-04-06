@@ -25,6 +25,8 @@ def run_portfolio_backtest(
     short_notional_ratio: float = 0.0,
     short_when_no_long_ratio: float = 0.0,
     equal_weight_long_if_no_positive: bool = False,
+    benchmark_daily_ret: Optional[pd.Series] = None,
+    benchmark_leg_fraction: float = 0.0,
 ) -> dict:
     """
     df 需含: date, id_col, close, 以及 rank_col（用于排序选股，如 prediction 或 score）。
@@ -36,6 +38,8 @@ def run_portfolio_backtest(
         空头名义 = 当日权益目标 equity_target × 该比例（与「无多时补空」配合）。
     equal_weight_long_if_no_positive: 为 True 时，若按「正分」筛完后没有多头权重，则改按 rank_col 排序取 head(top_n) 等权做多
         （用于短样本内预测全为负时仍持仓，避免空仓跑输大盘）。
+    benchmark_daily_ret: index=date，值为大盘日收益（如 sprtrn）；与 benchmark_leg_fraction 联用。
+    benchmark_leg_fraction: 在 0~1 时，将 equity_target×该比例配置于「复制大盘日收益」的账面腿，其余用于选股多头；与 short_notional_ratio>0 不并用。
     """
     if id_col not in df.columns or rank_col not in df.columns:
         return {"error": f"缺少列 {id_col} 或 {rank_col}", "total_return": 0.0, "final_value": initial_cash}
@@ -55,10 +59,37 @@ def run_portfolio_backtest(
     # 维护最近一次出现的价格：避免某些日期缺失该 ticker 行时把价格当 0
     last_prices: dict[str, float] = {}
 
+    sr = float(short_notional_ratio)
+    b_leg = float(benchmark_leg_fraction)
+    if benchmark_daily_ret is None or b_leg <= 1e-12 or sr > 0:
+        b_leg = 0.0
+    b_leg = max(0.0, min(1.0, b_leg))
+    bench_holding = 0.0
+
+    def _bench_r(dd) -> float:
+        if benchmark_daily_ret is None or len(benchmark_daily_ret) == 0:
+            return 0.0
+        try:
+            x = benchmark_daily_ret.get(dd)
+        except (KeyError, TypeError):
+            x = None
+        if x is None:
+            try:
+                x = benchmark_daily_ret.loc[dd]
+            except (KeyError, TypeError):
+                return 0.0
+        v = float(x) if not (isinstance(x, pd.Series) and len(x) > 0) else float(x.iloc[0])
+        return 0.0 if (np.isnan(v) or np.isinf(v)) else v
+
     for i, d in enumerate(dates):
         day_df = df[df["date"] == d].dropna(subset=["close", rank_col])
         if len(day_df) == 0:
-            equity_curve.append(equity_curve[-1] if equity_curve else initial_cash)
+            if b_leg > 0:
+                bench_holding *= 1.0 + _bench_r(d)
+            sm = sum(
+                float(positions.get(t, 0.0)) * float(last_prices.get(t, 0.0)) for t in positions
+            )
+            equity_curve.append(float(cash + sm + bench_holding))
             continue
         # 同一天同一 ticker 只保留一行，避免 prices 出现重复索引导致标量变 Series
         day_df = day_df.drop_duplicates(subset=[id_col], keep="first")
@@ -168,13 +199,21 @@ def run_portfolio_backtest(
             port_value = cash + sum(float(positions.get(t, 0.0)) * float(last_prices.get(t, 0.0)) for t in positions)
             equity_target = port_value * exposure  # 多头名义
 
-            sr = float(short_notional_ratio)
+            if b_leg > 0:
+                target_bench = equity_target * b_leg
+                stock_budget = equity_target * (1.0 - b_leg)
+                cash -= target_bench - bench_holding
+                bench_holding = target_bench
+                equity_for_stocks = stock_budget
+            else:
+                equity_for_stocks = equity_target
+
             if sr <= 0 and float(short_when_no_long_ratio) > 0 and n_long > 0 and not weights_long and weights_short:
                 long_notional = 0.0
-                short_notional = equity_target * float(short_when_no_long_ratio) if equity_target > 0 else 0.0
+                short_notional = equity_for_stocks * float(short_when_no_long_ratio) if equity_for_stocks > 0 else 0.0
             else:
-                long_notional = equity_target if equity_target > 0 else 0.0
-                short_notional = equity_target * sr if equity_target > 0 else 0.0
+                long_notional = equity_for_stocks if equity_for_stocks > 0 else 0.0
+                short_notional = equity_for_stocks * sr if equity_for_stocks > 0 else 0.0
 
             target_tickers = set(long_tickers) | set(short_tickers)
             for t in target_tickers:
@@ -200,7 +239,10 @@ def run_portfolio_backtest(
                     cash -= diff * pr
                     positions[t] = target_shares
 
+        if b_leg > 0:
+            bench_holding *= 1.0 + _bench_r(d)
         mark = cash + sum(positions.get(t, 0) * float(last_prices.get(t, 0.0)) for t in positions)
+        mark += bench_holding
         equity_curve.append(float(mark))
 
     eq = pd.Series(equity_curve, dtype=float)
