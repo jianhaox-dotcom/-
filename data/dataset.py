@@ -5,11 +5,79 @@
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Optional
 
 from config import COL_DATE, COL_CLOSE, COL_PREDICTION, TEST_RATIO
+
+
+def apply_return_percent_scale(df: pd.DataFrame, mode: str) -> tuple[pd.DataFrame, str]:
+    """
+    统一 ret / sprtrn / expected_RET / predicted_RET 的量纲为「小数收益」
+    （如 0.01 = 1%%）。若 CSV 存的是百分数（1.5 表示 1.5%%），应除以 100。
+
+    mode:
+      - decimal: 不缩放（已为小数）
+      - percent: 强制上述列 ÷100
+      - auto: 根据 ret 的分布推断（看中位、高分位与最大值，避免把正常小数误判成百分数）
+    """
+    m = (mode or "auto").strip().lower()
+    scale_cols = [c for c in ("ret", "sprtrn", "expected_RET", "predicted_RET") if c in df.columns]
+    if not scale_cols:
+        return df, "无 ret/sprtrn 等列，跳过收益口径处理"
+
+    def _scaled_copy(d: pd.DataFrame) -> pd.DataFrame:
+        out = d.copy()
+        for c in scale_cols:
+            out[c] = pd.to_numeric(out[c], errors="coerce") / 100.0
+        return out
+
+    if m == "decimal":
+        return df, "decimal：列已为小数收益，未 ÷100"
+
+    if m == "percent":
+        return _scaled_copy(df), "percent：已按百分数解读并对 ret/sprtrn/expected_RET/predicted_RET 除以 100"
+
+    # ---------- auto ----------
+    r = pd.to_numeric(df["ret"], errors="coerce")
+    r = r[np.isfinite(r.values)]
+    r = r[r != 0]
+    if len(r) < 200:
+        return df, "auto：有效 ret 过少，保持不缩放"
+
+    a = np.abs(r.to_numpy(dtype=float))
+    med = float(np.median(a))
+    p90 = float(np.percentile(a, 90))
+    p99 = float(np.percentile(a, 99))
+    mx = float(np.max(a))
+
+    # 小数日收益：成熟股票池 |ret| 中位多在 0.002～0.015（0.2%～1.5%），p90 多在 0.02～0.05
+    # 百分数写法（列里写 1.5 表示 1.5%%）：数值比「已是小数的同日收益」大约大 100 倍，中位常 ≥0.08
+    # 边界：若 CSV 把「百分数」写成 0.01 表示 1%%（未写 1.0），中位会在 0.008～0.02，仍须 ÷100，
+    #       否则按小数复利会爆出天文收益；故 med≥0.006 或 p90≥0.018 优先按百分数处理。
+    treat_as_percent = False
+    if med >= 0.006:
+        treat_as_percent = True
+    elif p90 >= 0.018:
+        treat_as_percent = True
+    elif med >= 0.12:
+        treat_as_percent = True
+    elif med >= 0.04 and p90 >= 0.25:
+        treat_as_percent = True
+    elif p90 >= 0.45 and mx <= 30.0:
+        treat_as_percent = True
+
+    if treat_as_percent:
+        return (
+            _scaled_copy(df),
+            f"auto：按百分数列处理（|ret| 中位={med:.4f}, p90={p90:.4f}, p99={p99:.4f}）已 ÷100",
+        )
+    return (
+        df,
+        f"auto：按小数收益处理（|ret| 中位={med:.6f}, p90={p90:.6f}）未 ÷100",
+    )
 
 
 def load_dataset(
@@ -38,7 +106,8 @@ def load_dataset(
     #   ticker = 文件名（去掉 _test_predictions 等后缀）
     #   ret = #RET
     #   close = (1+ret).cumprod()（合成价格，仅影响份额计算的标度，不影响回报）
-    #   date = 从固定基准日开始的合成日历（按行序递增）
+    #   date = 按「行号」对齐的交易日：第 i 行 = 全样本第 i 个交易日（横截面上多股同一天），
+    #         不把不同 CSV 用 split_id*n 错开到不同年。各行数可不同，短样本在后段日期缺失。
     if "#RET" in df.columns and "date" not in df.columns:
         ticker = path.stem
         for suffix in ["_test_predictions", "_predictions", "_test_prediction", "_prediction", "_test"]:
@@ -52,21 +121,10 @@ def load_dataset(
         df = df.rename(columns={"#RET": "ret"})
         df["ret"] = pd.to_numeric(df["ret"], errors="coerce").fillna(0.0)
 
-        # 用附近的数字文件夹名当作 split 序号（例如 root/TICKER/0/TICKER_test_predictions.csv）
-        split_id = 0
-        try:
-            for parent in path.parents:
-                name = parent.name
-                if name.isdigit():
-                    split_id = int(name)
-                    break
-        except Exception:
-            split_id = 0
-
-        base_date = pd.Timestamp("2000-01-01")
+        base_date = pd.Timestamp("2020-01-01")
         n = len(df)
-        day_idx = split_id * n + pd.Series(range(n)).astype(int).values
-        df["date"] = base_date + pd.to_timedelta(day_idx, unit="D")
+        # 与日历日不同：用连续交易日，使「约 n 行 ≈ n 个交易日」
+        df["date"] = pd.bdate_range(start=base_date, periods=n, freq="B")
         # 合成 close：从 1 开始累计回报
         df["close"] = (1.0 + df["ret"]).cumprod()
 

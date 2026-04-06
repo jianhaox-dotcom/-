@@ -21,7 +21,7 @@ from config import (
     INDEX_SHORT_MA_DAYS,
     INDEX_SHORT_SUM_DAYS,
 )
-from data import load_dataset, train_test_split
+from data import apply_return_percent_scale, load_dataset, train_test_split
 from features import build_features
 from features.build import FEATURE_NAMES
 from models import train_predictor, predict, train_ensemble, predict_ensemble
@@ -480,6 +480,13 @@ def main():
         default=1.0,
         help="波动缩放乘子上限",
     )
+    parser.add_argument(
+        "--ret-scale",
+        type=str,
+        default="auto",
+        choices=["auto", "decimal", "percent"],
+        help="收益列量纲：percent=CSV 为百分数(如 1.5 表示 1.5%%)对 ret/sprtrn/expected_RET/predicted_RET 除以 100；decimal=已是小数；auto=按分布自动判定",
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data_path)
@@ -508,6 +515,9 @@ def main():
         pred_col = "RET" if data_path.name.endswith(".csv") else None
         df = load_dataset(data_path, close_col=close_col, prediction_col=pred_col)
     print("1. 数据加载完成（支持多股票面板，ret 仅作目标/评估，不作交易信号）")
+
+    df, _ret_note = apply_return_percent_scale(df, args.ret_scale)
+    print(f"  收益口径: {_ret_note}")
 
     # 使用 ret 重建 close（保证跨 split 的 close 连续）
     if "ticker" in df.columns and "ret" in df.columns and "date" in df.columns:
